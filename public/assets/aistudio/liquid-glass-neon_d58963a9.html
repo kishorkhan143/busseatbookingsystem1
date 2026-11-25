@@ -1,0 +1,380 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Regular Glass — Neon (standalone WebGL)</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #05060a;
+               font-family: 'Inter', system-ui, -apple-system, sans-serif; }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+  #panel-label {
+    position: fixed; left: 0; top: 0; transform: translate(-50%, -50%);
+    color: #fff; font-weight: 600; font-size: 18px; pointer-events: none;
+    white-space: nowrap; text-shadow: 0 1px 4px rgba(0,0,0,0.3); z-index: 2;
+  }
+  #toggle {
+    position: fixed; top: 16px; left: 16px; z-index: 3; padding: 8px 14px;
+    border: 1px solid rgba(255,255,255,.35); border-radius: 999px;
+    background: rgba(255,255,255,.12); color: #fff; font: 600 13px Inter, system-ui, sans-serif;
+    backdrop-filter: blur(6px); cursor: pointer;
+  }
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+<div id="panel-label">Regular Glass</div>
+<button id="toggle">Neon: on</button>
+
+<script>
+/* ─────────────────────────────────────────────────────────────
+   Regular Glass parameters (same values the library uses)
+   floating: true, cornerRadius: 40, blurAmount: 0 (no blur pass),
+   zRadius 40, refraction 0.69, chromAberration 0.05,
+   edgeHighlight 0.05, specular 0, fresnel 1, opacity 1
+   ───────────────────────────────────────────────────────────── */
+const P = {
+  cornerRadius: 40,
+  zRadius: 40,
+  refraction: 0.69,
+  chromAberration: 0.05,
+  edgeHighlight: 0.05,
+  specular: 0.0,
+  fresnel: 1.0,
+  shadowOpacity: 0.30,
+  shadowSpread: 10,
+  shadowOffsetY: 1,
+};
+
+const canvas = document.getElementById('gl');
+const label  = document.getElementById('panel-label');
+const toggle = document.getElementById('toggle');
+const gl = canvas.getContext('webgl', { antialias: false, premultipliedAlpha: false });
+if (!gl) { alert('WebGL is not available in this browser.'); throw new Error('no webgl'); }
+
+/* ── Shaders (WebGL 1 / GLSL ES 1.0) ─────────────────────────── */
+const VS = `
+attribute vec2 a_pos;
+void main() { gl_Position = vec4(a_pos, 0.0, 1.0); }`;
+
+const FS = `
+precision highp float;
+
+uniform sampler2D u_bg;      // background, already cover-cropped
+uniform vec2  u_bgScale;     // cover-mode UV scale
+uniform vec2  u_bgOff;       // cover-mode UV offset
+uniform vec2  u_res;         // canvas size in device px
+uniform vec2  u_center;      // panel centre, device px (top-left origin)
+uniform vec2  u_half;        // panel half-size, device px
+uniform float u_radius;      // corner radius, device px
+uniform float u_zR;          // bevel depth, device px
+uniform float u_refract;
+uniform float u_chroma;
+uniform float u_edgeHL;
+uniform float u_fresnel;
+uniform float u_spec;
+uniform float u_shadowAlpha;
+uniform float u_shadowSpread; // device px
+uniform float u_shadowOffY;   // device px
+uniform float u_neon;         // 0 = off, 1 = on
+uniform float u_time;
+
+// Rounded-rectangle signed distance (negative inside)
+float rrSDF(vec2 p, vec2 b, float r) {
+  vec2 q = abs(p) - b + vec2(r);
+  return min(max(q.x, q.y), 0.0) + length(max(q, vec2(0.0))) - r;
+}
+
+// Pill / biconvex height field: smooth peak at centre, steep at edges.
+float bevelH(float d, float zR) {
+  if (d <= 0.0) return 0.0;
+  if (d >= zR)  return zR;
+  return sqrt(d * (2.0 * zR - d));
+}
+
+// Sample the background in screen-UV space (y = 1 at top of screen).
+vec3 bgSample(vec2 suv) {
+  return texture2D(u_bg, suv * u_bgScale + u_bgOff).rgb;
+}
+
+// Smooth iq-style cosine palette used for the neon colour cycle.
+vec3 neonPalette(float t) {
+  return 0.5 + 0.5 * cos(6.2831853 * (vec3(0.0, 0.33, 0.67) + t));
+}
+
+void main() {
+  // Device-pixel coordinates with a top-left origin.
+  vec2 px  = vec2(gl_FragCoord.x, u_res.y - gl_FragCoord.y);
+  vec2 suv = vec2(px.x / u_res.x, 1.0 - px.y / u_res.y);
+  vec2 lp  = px - u_center;                 // local px from panel centre
+  vec2 hf  = u_half;
+  float r  = min(u_radius, min(hf.x, hf.y));
+  float sdf = rrSDF(lp, hf, r);
+  float maxD = min(hf.x, hf.y);
+
+  // Neon colour, slowly cycling; varies a little across the screen.
+  vec3 neonCol = neonPalette(u_time * 0.08 + suv.x * 0.35 + suv.y * 0.2);
+  neonCol = mix(vec3(1.0), neonCol, 0.9);   // keep it vivid, not pure
+
+  // ── Outside the panel: background + drop shadow + neon halo ──
+  vec3 bgCol = bgSample(suv);
+  float sdfShadow = rrSDF(lp - vec2(0.0, u_shadowOffY), hf, r);
+  float d = max(sdfShadow - 1.0, 0.0);
+  float spread = max(u_shadowSpread, 1.0);
+  float outerShadow   = exp(-d * d / (spread * spread)) * 0.65;
+  float contactShadow = exp(-d * 0.08 / max(spread * 0.04, 0.01)) * 0.35;
+  float shadow = (outerShadow + contactShadow) * u_shadowAlpha;
+  vec3 outsideCol = bgCol * (1.0 - shadow);
+  outsideCol += neonCol * exp(-max(sdf, 0.0) * 0.06) * u_neon * 0.55;
+
+  // ── Inside the panel: height field → normal → refraction ──
+  float inside = -sdf;
+  float depth  = smoothstep(0.0, u_zR, inside);
+  float edge   = smoothstep(maxD * 0.35, 0.0, inside);   // 1 near rim
+
+  float e = 2.0;
+  float hC = bevelH(inside, u_zR);
+  float hR = bevelH(-rrSDF(lp + vec2(e, 0.0), hf, r), u_zR);
+  float hL = bevelH(-rrSDF(lp - vec2(e, 0.0), hf, r), u_zR);
+  float hU = bevelH(-rrSDF(lp + vec2(0.0, e), hf, r), u_zR);
+  float hD = bevelH(-rrSDF(lp - vec2(0.0, e), hf, r), u_zR);
+  vec2 hGrad = vec2(hR - hL, hU - hD) / (2.0 * e);
+  vec3 N = normalize(vec3(-hGrad, 1.0));
+
+  // Physically-flavoured dual-surface refraction (biconvex model).
+  float ior = 1.5;
+  float refrPow = 1.0 - 1.0 / ior;                 // Snell-style factor ≈ 0.333
+  float thickNorm = (hC * 2.0) / max(u_zR * 2.0, 1.0);
+  vec2 exitRefr    = hGrad * refrPow;
+  vec2 entryRefr   = hGrad * refrPow;
+  vec2 throughRefr = entryRefr * thickNorm * 0.5;
+  vec2 refrPx = (exitRefr + entryRefr + throughRefr) * u_refract * 30.0;
+  vec2 centerDir = -lp / max(hf, vec2(1.0));       // pull samples toward centre
+  refrPx += centerDir * u_refract * 4.0 * depth;
+
+  vec2 pxToUV = vec2(1.0, -1.0) / u_res;           // device px → screen UV
+  vec2 base = suv + refrPx * pxToUV;
+
+  // Chromatic aberration: R/G/B sampled with a normal-driven offset.
+  float caS = u_chroma * 18.0 * (edge * 0.7 + 0.3) * 2.0;
+  vec2 caD = N.xy * caS * pxToUV;
+  vec3 col = vec3(
+    bgSample(base + caD).r,
+    bgSample(base).g,
+    bgSample(base - caD).b
+  );
+
+  col *= 1.0 + 0.06 * depth;                       // slightly brighter core
+
+  // Fresnel (grazing-angle reflection)
+  float fres = pow(1.0 - abs(N.z), 4.0) * u_fresnel;
+
+  // Specular (multi-light Blinn-Phong); 0 by default for regular glass
+  vec3 V  = vec3(0.0, 0.0, 1.0);
+  vec3 H1 = normalize(normalize(vec3(0.4, 0.7, 1.0)) + V);
+  float sp1 = pow(max(dot(N, H1), 0.0), 90.0);
+  float totalSpec = sp1 * u_spec;
+
+  // Inner stroke + rim + inner glow
+  float borderWidth = 1.5;
+  float innerStroke = smoothstep(-borderWidth - 1.0, -borderWidth, sdf)
+                    * (1.0 - smoothstep(-1.0, 0.0, sdf));
+  float topBias = 0.5 + 0.5 * (-lp.y / hf.y);
+  innerStroke *= (0.4 + 0.6 * topBias);
+  float rim = edge * u_edgeHL * 0.22;
+  float innerGlow = smoothstep(5.0, 0.0, -sdf) * u_edgeHL * 0.15;
+  float envRefl = (N.y * 0.5 + 0.5) * fres * 0.08;
+
+  vec3 glass = col;
+  glass += vec3(totalSpec);
+  glass += vec3(rim + innerGlow);
+  glass += vec3(innerStroke * u_edgeHL * 0.55);
+  glass += vec3(envRefl);
+  glass = mix(glass, vec3(1.0), fres * 0.2);
+
+  // Neon: a coloured rim band that follows the bevel edge.
+  float band = exp(-abs(sdf + 1.0) * 0.35);
+  glass += neonCol * band * u_neon * 0.55;
+  glass  = mix(glass, glass + neonCol * 0.18, u_neon * edge);
+
+  // ── Composite: anti-aliased mask between outside and glass ──
+  float mask = 1.0 - smoothstep(-1.5, 0.5, sdf);
+  vec3 outc = mix(outsideCol, glass, mask);
+  gl_FragColor = vec4(clamp(outc, 0.0, 1.0), 1.0);
+}`;
+
+/* ── Compile / link ─────────────────────────────────────────── */
+function compile(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    throw new Error(gl.getShaderInfoLog(s));
+  }
+  return s;
+}
+const prog = gl.createProgram();
+gl.attachShader(prog, compile(gl.VERTEX_SHADER, VS));
+gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, FS));
+gl.linkProgram(prog);
+if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+gl.useProgram(prog);
+
+const U = {};
+['u_bg','u_bgScale','u_bgOff','u_res','u_center','u_half','u_radius','u_zR',
+ 'u_refract','u_chroma','u_edgeHL','u_fresnel','u_spec','u_shadowAlpha',
+ 'u_shadowSpread','u_shadowOffY','u_neon','u_time'
+].forEach(n => U[n] = gl.getUniformLocation(prog, n));
+
+// Full-screen quad
+const buf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
+const aPos = gl.getAttribLocation(prog, 'a_pos');
+gl.enableVertexAttribArray(aPos);
+gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+
+/* ── Background texture ────────────────────────────────────── */
+const tex = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D, tex);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+
+let bgW = 1, bgH = 1;
+function uploadBackground(source, w, h) {
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, source);
+  bgW = w; bgH = h;
+}
+
+// Procedural neon backdrop, used if bg.jpg can't be loaded (e.g. file://).
+function proceduralBackground() {
+  const c = document.createElement('canvas');
+  c.width = 1600; c.height = 1000;
+  const x = c.getContext('2d');
+  const g = x.createLinearGradient(0, 0, c.width, c.height);
+  g.addColorStop(0, '#120a2a'); g.addColorStop(0.5, '#05131f'); g.addColorStop(1, '#1a0717');
+  x.fillStyle = g; x.fillRect(0, 0, c.width, c.height);
+  const blobs = [['#ff2d95', 300, 300, 260], ['#00e5ff', 1200, 260, 300],
+                 ['#b6ff3b', 800, 780, 340], ['#7a5cff', 1350, 820, 240]];
+  for (const [col, bx, by, r] of blobs) {
+    const rg = x.createRadialGradient(bx, by, 0, bx, by, r);
+    rg.addColorStop(0, col); rg.addColorStop(1, 'rgba(0,0,0,0)');
+    x.globalAlpha = 0.85; x.fillStyle = rg; x.fillRect(0, 0, c.width, c.height);
+  }
+  x.globalAlpha = 1;
+  x.strokeStyle = 'rgba(255,255,255,0.12)'; x.lineWidth = 2;
+  for (let i = 0; i < c.width; i += 80) { x.beginPath(); x.moveTo(i, 0); x.lineTo(i, c.height); x.stroke(); }
+  for (let j = 0; j < c.height; j += 80) { x.beginPath(); x.moveTo(0, j); x.lineTo(c.width, j); x.stroke(); }
+  x.font = '900 180px Inter, system-ui, sans-serif';
+  x.textAlign = 'center'; x.textBaseline = 'middle';
+  x.fillStyle = '#fff'; x.shadowColor = '#ff2d95'; x.shadowBlur = 60;
+  x.fillText('NEON', c.width / 2, c.height / 2);
+  uploadBackground(c, c.width, c.height);
+}
+
+const img = new Image();
+img.onload = () => {
+  try { uploadBackground(img, img.naturalWidth, img.naturalHeight); }
+  catch (err) { proceduralBackground(); }   // file:// images are tainted in WebGL
+};
+img.onerror = proceduralBackground;   // fall back if the image is blocked
+img.src = 'bg.jpg';
+proceduralBackground();               // show something immediately
+
+/* ── Layout ─────────────────────────────────────────────────── */
+let dpr = 1, W = 1, H = 1;
+const panel = { x: 0, y: 0, w: 0, h: 0 };   // CSS px, centre + size
+
+function measurePanel() {
+  const r = label.getBoundingClientRect();
+  panel.w = r.width + 64;    // padding 24px 32px, as in the library demo
+  panel.h = r.height + 48;
+}
+
+function resize() {
+  dpr = Math.min(window.devicePixelRatio || 1, 2);
+  W = Math.floor(innerWidth * dpr);
+  H = Math.floor(innerHeight * dpr);
+  canvas.width = W; canvas.height = H;
+  gl.viewport(0, 0, W, H);
+  if (!panel.x && !panel.y) { panel.x = innerWidth / 2; panel.y = innerHeight / 2; }
+  measurePanel();
+}
+addEventListener('resize', resize);
+
+/* ── Floating drag (like the library's `floating: true`) ───── */
+let drag = null;
+function insidePanel(x, y) {
+  const r = Math.min(P.cornerRadius, Math.min(panel.w, panel.h) / 2);
+  const qx = Math.abs(x - panel.x) - panel.w / 2 + r;
+  const qy = Math.abs(y - panel.y) - panel.h / 2 + r;
+  const sdf = Math.min(Math.max(qx, qy), 0) + Math.hypot(Math.max(qx, 0), Math.max(qy, 0)) - r;
+  return sdf <= 0;
+}
+canvas.addEventListener('pointerdown', e => {
+  if (insidePanel(e.clientX, e.clientY)) {
+    drag = { dx: e.clientX - panel.x, dy: e.clientY - panel.y };
+    canvas.setPointerCapture(e.pointerId);
+  }
+});
+canvas.addEventListener('pointermove', e => {
+  if (!drag) return;
+  panel.x = e.clientX - drag.dx;
+  panel.y = e.clientY - drag.dy;
+});
+canvas.addEventListener('pointerup', () => drag = null);
+canvas.addEventListener('pointercancel', () => drag = null);
+
+/* ── Neon toggle ───────────────────────────────────────────── */
+let neon = 1;
+toggle.addEventListener('click', () => {
+  neon = neon ? 0 : 1;
+  toggle.textContent = 'Neon: ' + (neon ? 'on' : 'off');
+});
+
+/* ── Render loop ───────────────────────────────────────────── */
+const t0 = performance.now();
+function frame(now) {
+  const t = (now - t0) / 1000;
+
+  // Cover-mode transform so the background fills the canvas
+  const A = W / H, I = bgW / bgH;
+  let sx = 1, sy = 1, ox = 0, oy = 0;
+  if (A > I) { sy = I / A; oy = (1 - sy) / 2; }
+  else       { sx = A / I; ox = (1 - sx) / 2; }
+
+  gl.uniform1i(U.u_bg, 0);
+  gl.uniform2f(U.u_bgScale, sx, sy);
+  gl.uniform2f(U.u_bgOff, ox, oy);
+  gl.uniform2f(U.u_res, W, H);
+  gl.uniform2f(U.u_center, panel.x * dpr, panel.y * dpr);
+  gl.uniform2f(U.u_half, panel.w * dpr / 2, panel.h * dpr / 2);
+  gl.uniform1f(U.u_radius, P.cornerRadius * dpr);
+  gl.uniform1f(U.u_zR, P.zRadius * dpr);
+  gl.uniform1f(U.u_refract, P.refraction);
+  gl.uniform1f(U.u_chroma, P.chromAberration);
+  gl.uniform1f(U.u_edgeHL, P.edgeHighlight);
+  gl.uniform1f(U.u_fresnel, P.fresnel);
+  gl.uniform1f(U.u_spec, P.specular);
+  gl.uniform1f(U.u_shadowAlpha, P.shadowOpacity);
+  gl.uniform1f(U.u_shadowSpread, P.shadowSpread * dpr);
+  gl.uniform1f(U.u_shadowOffY, P.shadowOffsetY * dpr);
+  gl.uniform1f(U.u_neon, neon);
+  gl.uniform1f(U.u_time, t);
+
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+  label.style.left = panel.x + 'px';
+  label.style.top  = panel.y + 'px';
+  requestAnimationFrame(frame);
+}
+
+resize();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
